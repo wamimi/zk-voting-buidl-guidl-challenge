@@ -95,6 +95,7 @@ export const useScaffoldEventHistory = <
     chainId: selectedNetwork.id,
   });
   const [isFirstRender, setIsFirstRender] = useState(true);
+  const [hasError, setHasError] = useState(false); // ✅ FIX: Track if we've had an error to prevent infinite loops
 
   const { data: blockNumber } = useBlockNumber({ watch: watch, chainId: selectedNetwork.id });
 
@@ -150,7 +151,11 @@ export const useScaffoldEventHistory = <
 
       return data;
     },
-    enabled: enabled && isContractAddressAndClientReady,
+    enabled: enabled && isContractAddressAndClientReady && !hasError, // ✅ FIX: Disable query if we've had an error
+    retry: false, // ✅ FIX: Disable automatic retries to prevent infinite loops on errors
+    retryOnMount: false, // ✅ FIX: Don't retry on mount if there was an error
+    refetchOnWindowFocus: false, // ✅ FIX: Prevent refetching when window regains focus
+    refetchOnReconnect: false, // ✅ FIX: Prevent refetching when network reconnects
     initialPageParam: fromBlockValue,
     getNextPageParam: (lastPage, allPages, lastPageParam) => {
       if (!blockNumber || fromBlockValue >= blockNumber) return undefined;
@@ -184,25 +189,35 @@ export const useScaffoldEventHistory = <
     },
   });
 
+  // ✅ FIX: Track errors and disable query if we encounter one
   useEffect(() => {
-    const shouldSkipEffect = !blockNumber || !watch || isFirstRender;
+    if (query.error && !hasError) {
+      setHasError(true);
+    }
+  }, [query.error, hasError]);
+
+  useEffect(() => {
+    const shouldSkipEffect = !blockNumber || !watch || isFirstRender || query.error || hasError;
     if (shouldSkipEffect) {
       // skipping on first render, since on first render we should call queryFn with
       // fromBlock value, not blockNumber
+      // ✅ FIX: Also skip if there's an error to prevent infinite retry loops
       if (isFirstRender) setIsFirstRender(false);
       return;
     }
 
     query.fetchNextPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blockNumber, watch]);
+  }, [blockNumber, watch, query.error, hasError]);
 
   // Manual trigger to fetch next page when previous page completes
+  // ✅ FIX: Stop fetching if there's an error to prevent infinite loops
   useEffect(() => {
-    if (query.status === "success" && query.hasNextPage && !query.isFetchingNextPage && !query.error) {
+    if (query.status === "success" && query.hasNextPage && !query.isFetchingNextPage && !query.error && !hasError) {
       query.fetchNextPage();
     }
-  }, [query]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query.status, query.hasNextPage, query.isFetchingNextPage, query.error, hasError]);
 
   return {
     data: query.data?.pages,
@@ -210,6 +225,10 @@ export const useScaffoldEventHistory = <
     error: query.error,
     isLoading: query.isLoading,
     isFetchingNewEvent: query.isFetchingNextPage,
-    refetch: query.refetch,
+    refetch: async () => {
+      // ✅ FIX: Reset error state when manually refetching to allow retries
+      setHasError(false);
+      return query.refetch();
+    },
   };
 };
