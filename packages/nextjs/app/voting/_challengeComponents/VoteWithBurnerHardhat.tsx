@@ -89,7 +89,7 @@ export const VoteWithBurnerHardhat = ({ contractAddress }: { contractAddress?: `
   const { data: voteCastEvents } = useScaffoldEventHistory({
     contractName: "Voting",
     eventName: "VoteCast",
-    watch: true,
+    watch: false, // ✅ FIX: Disabled to prevent Alchemy rate limiting
     enabled: !!burnerWallet?.address,
   });
 
