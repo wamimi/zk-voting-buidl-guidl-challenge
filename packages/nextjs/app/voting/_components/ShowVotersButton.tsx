@@ -16,7 +16,7 @@ export const ShowVotersButton = () => {
   } = useScaffoldEventHistory({
     contractName: "Voting",
     eventName: "VoterAdded",
-    watch: true,
+    watch: false, // ✅ FIX: Disabled to prevent Alchemy rate limiting
     enabled: true,
   });
 
