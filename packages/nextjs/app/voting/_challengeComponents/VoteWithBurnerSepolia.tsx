@@ -22,20 +22,31 @@ import {
 import { notification } from "~~/utils/scaffold-eth";
 
 // Pimlico API key is pulled from your .env file
-const pimlicoUrl = `https://api.pimlico.io/v2/${sepolia.id}/rpc?apikey=${process.env.NEXT_PUBLIC_PIMLICO_API_KEY}`;
 const CHAIN_USED = sepolia;
 
-// Using a public Sepolia RPC for the Smart Account Client
-const RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
+// ✅ Using Alchemy RPC
+const RPC_URL = `https://eth-sepolia.g.alchemy.com/v2/${process.env.NEXT_PUBLIC_ALCHEMY_API_KEY}`;
 
-const pimlicoClient = createPimlicoClient({
-  chain: CHAIN_USED,
-  transport: http(pimlicoUrl),
-  entryPoint: {
-    address: entryPoint07Address,
-    version: "0.7" as EntryPointVersion,
-  },
-});
+// ✅ FIX: Create a function to get the Pimlico URL dynamically
+const getPimlicoUrl = () => {
+  const apiKey = process.env.NEXT_PUBLIC_PIMLICO_API_KEY;
+  if (!apiKey) {
+    throw new Error("NEXT_PUBLIC_PIMLICO_API_KEY is not set in environment variables");
+  }
+  return `https://api.pimlico.io/v2/${sepolia.id}/rpc?apikey=${apiKey}`;
+};
+
+// ✅ FIX: Create Pimlico client lazily when needed
+const createPimlicoClientInstance = () => {
+  return createPimlicoClient({
+    chain: CHAIN_USED,
+    transport: http(getPimlicoUrl()),
+    entryPoint: {
+      address: entryPoint07Address,
+      version: "0.7" as EntryPointVersion,
+    },
+  });
+};
 
 /**
  * Checkpoint 10: Logic to create a sponsored Smart Account
@@ -45,6 +56,7 @@ const createSmartAccount = async (): Promise<{
   smartAccountClient: any;
   smartAccount: `0x${string}`;
   walletOwner: `0x${string}`;
+  pimlicoClient: any;
 }> => {
   try {
     // 1. Generate a brand new burner EOA (The Remote Control)
@@ -63,11 +75,14 @@ const createSmartAccount = async (): Promise<{
       version: "1.4.1",
     });
 
-    // 3. Create the client that talks to the Pimlico Bundler/Paymaster
+    // 3. Create the Pimlico client dynamically
+    const pimlicoClient = createPimlicoClientInstance();
+
+    // 4. Create the client that talks to the Pimlico Bundler/Paymaster
     const smartAccountClient = createSmartAccountClient({
       account,
       chain: CHAIN_USED,
-      bundlerTransport: http(pimlicoUrl),
+      bundlerTransport: http(getPimlicoUrl()),
       paymaster: pimlicoClient,
       userOperation: {
         estimateFeesPerGas: async () => {
@@ -80,6 +95,7 @@ const createSmartAccount = async (): Promise<{
       smartAccountClient,
       smartAccount: account.address as `0x${string}`,
       walletOwner: wallet.address as `0x${string}`,
+      pimlicoClient,
     };
   } catch (error) {
     console.error("Error creating smart account:", error);
@@ -118,12 +134,17 @@ const voteOnSepolia = async ({
     ],
   });
 
+  console.log("📤 Submitting UserOp to Pimlico...");
+
   // Send the sponsored UserOperation
   const userOpHash = await smartAccountClient.sendTransaction({
     to: (contractAddress || contractInfo?.address) as `0x${string}`,
     data: callData,
     value: 0n,
   });
+
+  console.log("✅ UserOp submitted:", userOpHash);
+  console.log("🔗 Track on Jiffyscan:", `https://jiffyscan.xyz/userOp/${userOpHash}?network=sepolia`);
 
   return { userOpHash };
 };
@@ -135,6 +156,7 @@ export const VoteWithBurnerSepolia = ({ contractAddress }: { contractAddress?: `
   const [hasSuccessfulVote, setHasSuccessfulVote] = useState<boolean>(false);
   const [walletOwner, setWalletOwner] = useState<`0x${string}` | null>(null);
   const [smartAccountClient, setSmartAccountClient] = useState<any>(null);
+  const [pimlicoClient, setPimlicoClient] = useState<any>(null);
   const [votedSmartAccount, setVotedSmartAccount] = useState<`0x${string}` | null>(null);
   const { proofData, setProofData } = useChallengeState();
   const { address: userAddress } = useAccount();
@@ -186,6 +208,48 @@ export const VoteWithBurnerSepolia = ({ contractAddress }: { contractAddress?: `
     checkAndLoadStoredData();
   }, [contractAddress, contractInfo?.address, userAddress, proofData, setProofData]);
 
+  // ✅ NEW: Check if this proof was already used to vote (on component mount)
+  useEffect(() => {
+    const checkExistingVote = async () => {
+      if (!proofData || !contractInfo || !userAddress) return;
+
+      const effectiveContractAddress = contractAddress || contractInfo?.address;
+      if (!effectiveContractAddress) return;
+
+      try {
+        const publicClient = createPublicClient({
+          chain: sepolia,
+          transport: http(),
+        });
+
+        const nullifierHash = proofData.publicInputs[0];
+
+        console.log("🔍 Checking if proof was already used...");
+
+        // ✅ FIX: Cast to any to bypass TypeScript strict typing
+        const isUsed = (await publicClient.readContract({
+          address: effectiveContractAddress as `0x${string}`,
+          abi: contractInfo.abi as any,
+          functionName: "nullifierUsed" as any,
+          args: [nullifierHash],
+        })) as boolean;
+
+        if (isUsed) {
+          console.log("✅ This proof was already used to vote!");
+          setHasSuccessfulVote(true);
+          setTxStatus("success");
+          notification.info("This proof was already used to vote! Generate a new proof to vote again.");
+        } else {
+          console.log("📝 Proof not yet used - ready to vote!");
+        }
+      } catch (error) {
+        console.error("Could not check vote status:", error);
+      }
+    };
+
+    checkExistingVote();
+  }, [proofData, contractAddress, contractInfo, userAddress]);
+
   return (
     <div className="bg-base-100 shadow rounded-xl p-6 space-y-4">
       <div className="space-y-1 text-center">
@@ -213,15 +277,18 @@ export const VoteWithBurnerSepolia = ({ contractAddress }: { contractAddress?: `
               let client = smartAccountClient;
               let currentSmartAccount = smartAccount;
               let currentWalletOwner = walletOwner;
+              let currentPimlicoClient = pimlicoClient;
 
               if (!client) {
                 const created = await createSmartAccount();
                 client = created.smartAccountClient;
                 currentSmartAccount = created.smartAccount;
                 currentWalletOwner = created.walletOwner;
+                currentPimlicoClient = created.pimlicoClient;
                 setSmartAccountClient(client);
                 setSmartAccount(currentSmartAccount);
                 setWalletOwner(currentWalletOwner);
+                setPimlicoClient(currentPimlicoClient);
               }
 
               const { userOpHash } = await voteOnSepolia({
@@ -231,25 +298,159 @@ export const VoteWithBurnerSepolia = ({ contractAddress }: { contractAddress?: `
                 smartAccountClient: client,
               });
 
-              const receipt = await pimlicoClient.waitForUserOperationReceipt({ hash: userOpHash });
+              // Show tracking notification immediately
+              notification.info(
+                <>
+                  ⏳ Waiting for confirmation (up to 2 minutes)...
+                  <br />
+                  <a
+                    href={`https://jiffyscan.xyz/userOp/${userOpHash}?network=sepolia`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="link text-xs"
+                  >
+                    Track on Jiffyscan →
+                  </a>
+                </>,
+              );
 
-              if (receipt.success) {
-                setTxStatus("success");
-                setHasSuccessfulVote(true);
-                saveTransactionResultToLocalStorage(userOpHash, true, effectiveContractAddress!, userAddress!, {
-                  ...receipt,
-                  smartAccountAddress: currentSmartAccount,
+              try {
+                // ✅ TRY to wait for receipt with longer timeout
+                const receipt = await currentPimlicoClient.waitForUserOperationReceipt({
+                  hash: userOpHash,
+                  timeout: 120000, // 2 minutes
                 });
-                setVotedSmartAccount(currentSmartAccount);
-                notification.success("Anonymous vote cast successfully on Sepolia!");
-              } else {
-                setTxStatus("error");
-                notification.error("User Operation failed.");
+
+                if (receipt.success) {
+                  console.log("✅ Vote confirmed on-chain!");
+                  setTxStatus("success");
+                  setHasSuccessfulVote(true);
+                  saveTransactionResultToLocalStorage(userOpHash, true, effectiveContractAddress!, userAddress!, {
+                    ...receipt,
+                    smartAccountAddress: currentSmartAccount,
+                  });
+                  setVotedSmartAccount(currentSmartAccount);
+
+                  notification.success(
+                    <>
+                      🎉 Anonymous vote cast successfully!
+                      <br />
+                      <a
+                        href={`https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="link text-xs"
+                      >
+                        View on Etherscan →
+                      </a>
+                    </>,
+                  );
+                } else {
+                  throw new Error("UserOperation failed");
+                }
+              } catch {
+                // ✅ TIMEOUT HANDLING - Check if vote actually succeeded!
+                console.warn("⚠️ Timeout or error while waiting, checking on-chain status...");
+
+                // Wait a bit for propagation
+                await new Promise(resolve => setTimeout(resolve, 5000));
+
+                // Check if nullifier was used (means vote succeeded!)
+                try {
+                  const publicClient = createPublicClient({
+                    chain: sepolia,
+                    transport: http(),
+                  });
+
+                  const nullifierHash = proofData.publicInputs[0];
+
+                  // ✅ FIX: Cast to any to bypass TypeScript strict typing
+                  const isUsed = (await publicClient.readContract({
+                    address: effectiveContractAddress as `0x${string}`,
+                    abi: (contractInfo?.abi as any) || [],
+                    functionName: "nullifierUsed" as any,
+                    args: [nullifierHash],
+                  })) as boolean;
+
+                  if (isUsed) {
+                    // ✅ VOTE ACTUALLY SUCCEEDED!
+                    console.log("✅ Vote succeeded despite timeout!");
+                    setTxStatus("success");
+                    setHasSuccessfulVote(true);
+                    saveTransactionResultToLocalStorage(userOpHash, true, effectiveContractAddress!, userAddress!, {
+                      success: true,
+                      smartAccountAddress: currentSmartAccount,
+                    });
+                    setVotedSmartAccount(currentSmartAccount);
+
+                    notification.success(
+                      <>
+                        🎉 Vote confirmed on-chain!
+                        <br />
+                        <small className="opacity-70">Took longer than expected but succeeded!</small>
+                        <br />
+                        <a
+                          href={`https://sepolia.etherscan.io/address/${effectiveContractAddress}#events`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="link text-xs"
+                        >
+                          View events on Etherscan →
+                        </a>
+                      </>,
+                    );
+                  } else {
+                    // ❌ Actually failed
+                    throw new Error("Vote was not recorded on-chain");
+                  }
+                } catch (checkError) {
+                  console.error("❌ Could not verify on-chain status:", checkError);
+                  setTxStatus("error");
+                  notification.warning(
+                    <>
+                      ⚠️ Could not confirm vote status.
+                      <br />
+                      <small>Your vote may have succeeded - check manually:</small>
+                      <br />
+                      <a
+                        href={`https://jiffyscan.xyz/userOp/${userOpHash}?network=sepolia`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="link text-xs"
+                      >
+                        Check on Jiffyscan →
+                      </a>
+                    </>,
+                  );
+                }
               }
             } catch (e) {
               console.error("Error voting:", e);
               setTxStatus("error");
-              notification.error(e instanceof Error ? e.message : "Submission failed.");
+
+              if (e instanceof Error) {
+                // ✅ Handle "already voted" error specially
+                if (
+                  e.message.includes("Nullifier") ||
+                  e.message.includes("already used") ||
+                  e.message.includes("reverted")
+                ) {
+                  notification.warning(
+                    <>
+                      ⚠️ This proof was already used to vote!
+                      <br />
+                      <small>Clear storage and generate a new proof to vote again.</small>
+                    </>,
+                  );
+                  // Check if vote actually succeeded
+                  setHasSuccessfulVote(true);
+                  setTxStatus("success");
+                } else {
+                  notification.error(e.message);
+                }
+              } else {
+                notification.error("Submission failed.");
+              }
             }
           }}
         >
