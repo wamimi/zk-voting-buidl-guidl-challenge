@@ -1,13 +1,11 @@
 "use client";
 
 import { useState } from "react";
-//// Checkpoint 8 //////
 import { UltraHonkBackend } from "@aztec/bb.js";
 // @ts-ignore
 import { Noir } from "@noir-lang/noir_js";
 import { LeanIMT } from "@zk-kit/lean-imt";
 import { poseidon1, poseidon2 } from "poseidon-lite";
-import { encodeAbiParameters, toHex } from "viem";
 import { useAccount } from "wagmi";
 import { useDeployedContractInfo, useScaffoldReadContract } from "~~/hooks/scaffold-eth";
 import { useChallengeState } from "~~/services/store/challengeStore";
@@ -24,23 +22,37 @@ const generateProof = async (
   _leaves: any[],
   _circuitData: any,
 ) => {
-  /// Checkpoint 8 //////
   const nullifierHash = poseidon1([BigInt(_nullifier)]);
   const calculatedTree = new LeanIMT((a: bigint, b: bigint) => poseidon2([a, b]));
-  const leaves = _leaves.map(event => {
-    return event?.args.value;
-  });
-  const leavesReversed = leaves.reverse();
-  calculatedTree.insertMany(leavesReversed as bigint[]);
+
+  // ✅ Sort events by index field to ensure correct chronological order
+  const sortedLeaves = _leaves
+    .map(event => ({
+      index: Number(event?.args.index),
+      value: event?.args.value,
+    }))
+    .sort((a, b) => a.index - b.index);
+
+  const leafValues = sortedLeaves.map(item => item.value);
+  calculatedTree.insertMany(leafValues as bigint[]);
+
+  // 🚨 ROOT GUARDRAIL
+  const localRoot = calculatedTree.root;
+  if (localRoot !== _root) {
+    console.error("❌ ROOT MISMATCH!");
+    throw new Error(
+      `Tree Mismatch: Local root (${localRoot}) doesn't match contract (${_root}). Found ${leafValues.length} leaves.`,
+    );
+  }
+
   const calculatedProof = calculatedTree.generateProof(_index);
-  const sibs = calculatedProof.siblings.map(sib => {
-    return sib.toString();
-  });
+  const sibs = calculatedProof.siblings.map(sib => sib.toString());
 
   const lengthDiff = 16 - sibs.length;
   for (let i = 0; i < lengthDiff; i++) {
     sibs.push("0");
   }
+
   const input = {
     nullifier_hash: nullifierHash.toString(),
     nullifier: BigInt(_nullifier).toString(),
@@ -51,37 +63,23 @@ const generateProof = async (
     index: _index.toString(),
     siblings: sibs,
   };
+
   try {
     const noir = new Noir(_circuitData);
     const { witness } = await noir.execute(input);
-    console.log("witness", witness);
     const honk = new UltraHonkBackend(_circuitData.bytecode, { threads: 1 });
     const originalLog = console.log;
     console.log = () => {};
-    const { proof, publicInputs } = await honk.generateProof(witness, {
-      keccak: true,
-    });
+    const { proof, publicInputs } = await honk.generateProof(witness, { keccak: true });
     console.log = originalLog;
-    console.log("proof", proof);
-    const proofHex = toHex(proof);
-    const inputsHex = publicInputs.map(x =>
-      typeof x === "string" ? (x as `0x${string}`) : toHex(x as Uint8Array, { size: 32 }),
-    );
-    const result = encodeAbiParameters([{ type: "bytes" }, { type: "bytes32[]" }], [proofHex, inputsHex]);
-    console.log("result", result);
     return { proof, publicInputs };
   } catch (error) {
-    console.log(error);
+    console.error("ZK Error:", error);
     throw error;
   }
 };
 
-interface CreateCommitmentProps {
-  leafEvents?: any[];
-}
-
-export const GenerateProof = ({ leafEvents = [] }: CreateCommitmentProps) => {
-  const [, setCircuitData] = useState<any>(null);
+export const GenerateProof = ({ leafEvents = [] }: { leafEvents?: any[] }) => {
   const [isLoading, setIsLoading] = useState(false);
   const { commitmentData, setProofData, voteChoice } = useChallengeState();
   const { address: userAddress, isConnected } = useAccount();
@@ -107,93 +105,57 @@ export const GenerateProof = ({ leafEvents = [] }: CreateCommitmentProps) => {
 
   const isVoter = voterData?.[0];
   const hasRegistered = voterData?.[1];
-
   const canVote = Boolean(isConnected && isVoter === true && hasRegistered === true);
-
   const hasExistingProof = hasStoredProof(deployedContractData?.address, userAddress);
 
   const getCircuitDataAndGenerateProof = async () => {
     setIsLoading(true);
     try {
-      // Ensure commitment inputs are loaded from localStorage when available
       const storedCommitment =
         deployedContractData?.address && userAddress
           ? loadCommitmentFromLocalStorage(deployedContractData.address, userAddress)
           : null;
 
-      // Reflect stored values in the UI if inputs are empty
       if ((!nullifierInput || !secretInput || indexInput?.trim() === "") && storedCommitment) {
         setNullifierInput(storedCommitment.nullifier);
         setSecretInput(storedCommitment.secret);
         setIndexInput(storedCommitment.index?.toString() ?? "");
       }
 
-      const response = await fetch("/api/circuit");
-      if (!response.ok) {
-        throw new Error("Failed to fetch circuit data");
-      }
-
       let fetchedCircuitData: any;
-      try {
-        const apiRes = await fetch("/api/circuit");
-        if (!apiRes.ok) throw new Error("API fetch failed");
-        fetchedCircuitData = await apiRes.json();
-      } catch {
+      const response = await fetch("/api/circuit");
+      if (response.ok) {
+        fetchedCircuitData = await response.json();
+      } else {
         const staticRes = await fetch("circuits.json");
-        if (!staticRes.ok) {
-          throw new Error("Failed to fetch circuit data");
-        }
         fetchedCircuitData = await staticRes.json();
       }
-      setCircuitData(fetchedCircuitData);
 
-      const effectiveNullifier = (
-        nullifierInput?.trim() ||
-        commitmentData?.nullifier ||
-        storedCommitment?.nullifier
-      )?.trim();
-      const effectiveSecret = (secretInput?.trim() || commitmentData?.secret || storedCommitment?.secret)?.trim();
-      const effectiveIndex =
+      const effNull = (nullifierInput?.trim() || commitmentData?.nullifier || storedCommitment?.nullifier)?.trim();
+      const effSec = (secretInput?.trim() || commitmentData?.secret || storedCommitment?.secret)?.trim();
+      const effIdx =
         indexInput?.trim() !== "" ? Number(indexInput) : (commitmentData?.index ?? storedCommitment?.index);
 
-      if (voteChoice === null) {
-        throw new Error("Please select your vote (Yes/No) first");
-      }
+      if (voteChoice === null) throw new Error("Select Yes/No first");
+      if (!effNull || !effSec || effIdx === undefined) throw new Error("Missing commitment data.");
 
-      if (!leafEvents || leafEvents.length === 0) {
-        throw new Error("There are no commitments in the tree yet. Please insert a commitment first.");
-      }
-
-      if (!effectiveNullifier || !effectiveSecret || effectiveIndex === undefined) {
-        throw new Error(
-          "Missing commitment inputs. Paste your saved data or ensure you have generated & inserted a commitment.",
-        );
-      }
-
-      const generatedProof = await generateProof(
+      const result = await generateProof(
         root as bigint,
         voteChoice,
-        treeDepth as unknown as number,
-        effectiveNullifier,
-        effectiveSecret,
-        effectiveIndex as number,
-        leafEvents as any,
+        Number(treeDepth),
+        effNull,
+        effSec,
+        effIdx,
+        leafEvents,
         fetchedCircuitData,
       );
-      setProofData({
-        proof: generatedProof.proof,
-        publicInputs: generatedProof.publicInputs,
-      });
 
-      saveProofToLocalStorage(
-        { proof: generatedProof.proof, publicInputs: generatedProof.publicInputs },
-        deployedContractData?.address,
-        voteChoice,
-        userAddress,
-      );
+      setProofData(result);
+      saveProofToLocalStorage(result, deployedContractData?.address, voteChoice, userAddress);
+      notification.success("Proof Ready!");
     } catch (error) {
-      console.error("Error in getCircuitDataAndGenerateProof:", error);
-      notification.error((error as Error).message || "Failed to generate proof");
+      console.error(error);
+      notification.error((error as Error).message || "Proving failed");
     } finally {
       setIsLoading(false);
     }
@@ -201,32 +163,26 @@ export const GenerateProof = ({ leafEvents = [] }: CreateCommitmentProps) => {
 
   return (
     <div className="bg-base-100 shadow rounded-xl p-6 space-y-5">
-      <div className="space-y-1">
-        <h2 className="text-2xl font-bold text-center"> Generate ZK proof off-chain </h2>
-        <p className="text-sm opacity-70">
-          Prove membership in the Merkle tree and add your voting decision to the proof.
-        </p>
+      <div className="space-y-1 text-center">
+        <h2 className="text-2xl font-bold">Generate ZK Proof</h2>
+        <p className="text-sm opacity-70 italic">Math: Poseidon2 | Prover: UltraHonk</p>
       </div>
-
-      <div className="flex flex-col gap-4">
-        <div className="flex flex-wrap gap-2 justify-center">
-          <button
-            type="button"
-            className={`btn ${canVote && !hasExistingProof && voteChoice !== null ? "btn-primary" : "btn-disabled"}`}
-            onClick={canVote && !hasExistingProof && voteChoice !== null ? getCircuitDataAndGenerateProof : undefined}
-            disabled={isLoading || !canVote || hasExistingProof || voteChoice === null}
-          >
-            {isLoading
-              ? "Generating proof..."
-              : hasExistingProof
-                ? "Proof already exists"
-                : !canVote
-                  ? "Must register first"
-                  : voteChoice === null
-                    ? "Select choice first"
-                    : "Generate proof"}
-          </button>
-        </div>
+      <div className="flex justify-center">
+        <button
+          className={`btn ${canVote && !hasExistingProof && voteChoice !== null ? "btn-primary" : "btn-disabled"}`}
+          onClick={getCircuitDataAndGenerateProof}
+          disabled={isLoading || !canVote || hasExistingProof || voteChoice === null}
+        >
+          {isLoading ? (
+            <>
+              <span className="loading loading-spinner loading-xs"></span> Generating...
+            </>
+          ) : hasExistingProof ? (
+            "Proof Ready ✅"
+          ) : (
+            "Generate Proof"
+          )}
+        </button>
       </div>
     </div>
   );
